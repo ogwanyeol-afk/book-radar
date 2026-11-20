@@ -282,8 +282,6 @@ def build_queries(p: Profile, max_queries: int = 10, purpose: str | None = None)
 
     def add(q: str, topic: str | None, kws: list[str]):
         q = " ".join(w.upper() if w.isascii() and len(w) <= 4 else w for w in q.split())  # etf→ETF
-        if purpose:
-            q = f"{q} {purpose}"
         if q and q not in seen and len(qs) < max_queries:
             seen.add(q)
             qs.append({"query": q, "topic": topic, "keywords": kws})
@@ -317,6 +315,12 @@ def build_queries(p: Profile, max_queries: int = 10, purpose: str | None = None)
         if not topic_of(k) and s >= top_score * 0.3 and k not in in_phrase:
             add(k, None, [k])
 
+    # 4-1) 원하는 책 성격(입문·실전 등)은 상위 주제 2개에만 붙여 추가 검색 (나머지는 점수로 반영)
+    if purpose:
+        for tp, _, kws in p.topics[:2]:
+            if kws:
+                qs.append({"query": f"{kws[0]} {purpose}", "topic": tp, "keywords": [kws[0]]})
+
     # 5) 그래도 모자라면 주제 대표 검색어
     for tp, _, _ in p.topics[:3]:
         for seed in TOPICS[tp]["seeds"]:
@@ -334,7 +338,8 @@ def _year(pd: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
-def score_books(books: list[Book], p: Profile, include_study: bool = False) -> list[Book]:
+def score_books(books: list[Book], p: Profile, include_study: bool = False,
+                purpose: str | None = None) -> list[Book]:
     top = p.keywords[:40]
     mx = top[0][1] if top else 1.0
     this_year = date.today().year
@@ -358,7 +363,12 @@ def score_books(books: list[Book], p: Profile, include_study: bool = False) -> l
             rel += min(math.log10(b.loan_count + 1) * 0.25, 1.0)   # 공공도서관에서 많이 빌린 책
         y = _year(b.pub_date)
         if y:
-            rel += 0.3 if this_year - y <= 3 else (-0.3 if this_year - y > 15 else 0)
+            age = this_year - y
+            rel += 0.3 if age <= 3 else (-0.6 if age > 10 else 0)
+            if age > 4 and any(q.get("topic") == "세금·회계" for q in b.queries):
+                rel -= 0.8                                         # 세법은 개정이 잦아 오래된 책 감점
+        if purpose and purpose.lower() in text:
+            rel += 0.8
         if b.price and b.price < 10000 and not b.loan_count:
             rel -= 0.8                                             # 소책자·저가 자가출판물 감점
         if y and this_year - y == 0 and not b.loan_count and "data4library" not in b.sources:
@@ -370,7 +380,15 @@ def score_books(books: list[Book], p: Profile, include_study: bool = False) -> l
         tp = next(iter(topics), None)
         b.reason = (f"{tp} 관심" if tp else "기록 속 관심어") + (f" — '{', '.join(kws)}' 관련" if kws else "")
         out.append(b)
-    return sorted(out, key=lambda x: -x.score)
+    out.sort(key=lambda x: -x.score)
+    seen, uniq = set(), []
+    for b in out:   # 같은 책의 연도별 개정판·판본 중복 제거 (점수 높은 것 하나만)
+        t = re.sub(r"\(.*?\)|\[.*?\]|\d{4}|개정.*판|최신판|[\s\W_]+", "", b.title).lower()
+        if t and t in seen:
+            continue
+        seen.add(t)
+        uniq.append(b)
+    return uniq
 
 
 def diversify(books: list[Book], count: int) -> list[Book]:
@@ -446,7 +464,7 @@ async def recommend(p: Profile, *, count: int = 10, providers: list[Provider] | 
                     cur.review_rank = b.review_rank
                 if b.loan_count and (cur.loan_count or 0) < b.loan_count:
                     cur.loan_count = b.loan_count
-    ranked = diversify(score_books(list(pool.values()), p, include_study), count)
+    ranked = diversify(score_books(list(pool.values()), p, include_study, purpose), count)
     out = {"books": [b.as_dict() for b in ranked], "queries": [q["query"] for q in queries],
            "candidates": len(pool)}
     if errors:
