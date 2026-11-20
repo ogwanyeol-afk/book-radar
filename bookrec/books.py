@@ -330,6 +330,8 @@ def build_queries(p: Profile, max_queries: int = 10, purpose: str | None = None)
 
 # ---------------------------------------------------------------- 점수화
 
+_STUDY = re.compile(r"수험|기출|문제집|모의고사|합격|1차\s*시험|2차\s*시험|자격증|공인회계사|세무사\s*시험|"
+                    r"회계사\s*시험|해커스|에듀윌|시대에듀|박문각|대학교재|교과서|워크북|세법개론|세법엔딩")
 _AI_AUTHOR = re.compile(r"\b(gemini|gpt|chatgpt|claude|llama|copilot|grok)\b", re.I)
 
 
@@ -347,6 +349,8 @@ def score_books(books: list[Book], p: Profile, include_study: bool = False,
     for b in books:
         if not include_study and any(x in b.category for x in EXCLUDED_CATEGORIES):
             continue
+        if not include_study and _STUDY.search(f"{b.title} {b.description[:200]} {b.publisher}"):
+            continue  # 분류 정보가 없는 카카오 결과용 수험서·교재 판별
         if _AI_AUTHOR.search(b.author or ""):
             continue  # AI 모델명을 저자로 단 자동생성 출판물
         text = f"{b.title} {b.description} {b.category}".lower()
