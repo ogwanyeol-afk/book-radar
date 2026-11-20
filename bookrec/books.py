@@ -42,6 +42,7 @@ class Book:
     score: float = 0.0
     reason: str = ""
     naver_link: str = ""
+    loan_count: int | None = None
 
     def key(self) -> str:
         if self.isbn13:
@@ -54,7 +55,7 @@ class Book:
             "pub_date": self.pub_date, "isbn13": self.isbn13, "price": self.price,
             "category": self.category, "link": self.link, "cover": self.cover,
             "description": (self.description[:180] + "…") if len(self.description) > 180 else self.description,
-            "reason": self.reason, "score": round(self.score, 3),
+            "reason": self.reason, "score": round(self.score, 3), "library_loans": self.loan_count,
             "buy_links": buy_links(self.isbn13, self.title,
                                    self.link if "aladin" in self.sources else "", self.naver_link),
         }
@@ -183,6 +184,60 @@ class NaverBook(Provider):
         return out
 
 
+class KakaoBook(Provider):
+    """카카오(다음) 책 검색 — developers.kakao.com 앱 생성 후 REST API 키. 무료 일 3만 건 수준."""
+    name = "kakao"
+    URL = "https://dapi.kakao.com/v3/search/book"
+
+    def __init__(self, rest_key: str):
+        self.h = {"Authorization": f"KakaoAK {rest_key}"}
+
+    async def search(self, client, query, n=20):
+        r = await client.get(self.URL, headers=self.h,
+                             params={"query": query, "size": min(n, 50), "sort": "accuracy", "target": "title"})
+        if r.status_code == 200 and not r.json().get("documents"):
+            # 제목에 없으면 전체(내용 포함)로 한 번 더
+            r = await client.get(self.URL, headers=self.h, params={"query": query, "size": min(n, 50)})
+        r.raise_for_status()
+        out = []
+        for d in r.json().get("documents", []):
+            if d.get("status") and d["status"] not in ("정상판매", ""):
+                continue  # 절판·품절 제외
+            isbn = (d.get("isbn") or "").split()
+            out.append(Book(title=_clean(d.get("title")), author=", ".join(d.get("authors") or []),
+                            publisher=_clean(d.get("publisher")), pub_date=(d.get("datetime") or "")[:10],
+                            isbn13=next((x for x in isbn if len(x) == 13), ""),
+                            price=d.get("sale_price") if (d.get("sale_price") or 0) > 0 else d.get("price"),
+                            cover=d.get("thumbnail", ""), description=_clean(d.get("contents")),
+                            sources={"kakao"}))
+        return out
+
+
+class Data4LibrarySearch(Provider):
+    """도서관 정보나루 키워드 도서검색 — 공공도서관 대출 건수(loan_count)와 주제분류(KDC)를 함께 준다."""
+    name = "data4library"
+    URL = "https://data4library.kr/api/srchBooks"
+
+    def __init__(self, key: str):
+        self.key = key
+
+    async def search(self, client, query, n=20):
+        r = await client.get(self.URL, params={"authKey": self.key, "keyword": query, "pageNo": 1,
+                                               "pageSize": min(n, 50), "format": "json"})
+        r.raise_for_status()
+        docs = (r.json().get("response") or {}).get("docs") or []
+        out = []
+        for d in docs:
+            b = d.get("doc") or d.get("book") or d
+            lc = str(b.get("loan_count", "")).replace(",", "")
+            out.append(Book(title=_clean(b.get("bookname")), author=_clean(b.get("authors")),
+                            publisher=_clean(b.get("publisher")), pub_date=str(b.get("publication_year", "")),
+                            isbn13=b.get("isbn13", ""), cover=b.get("bookImageURL", ""),
+                            category=_clean(b.get("class_nm")), loan_count=int(lc) if lc.isdigit() else None,
+                            sources={"data4library"}))
+        return out
+
+
 class Data4Library:
     """도서관 정보나루 — https://www.data4library.kr 인증키. 실제 대출 데이터 기반 '함께 빌린 책'."""
     URL = "https://data4library.kr/api/recommandList"
@@ -205,11 +260,16 @@ class Data4Library:
 
 
 def providers_from_env() -> list[Provider]:
+    """설정된 키만큼 검색원 사용. 알라딘 OpenAPI는 2026-11-01 종료, 네이버 책 검색은 2026-07-31 이전 발급 키만."""
     ps: list[Provider] = []
-    if os.getenv("ALADIN_TTB_KEY"):
-        ps.append(Aladin(os.environ["ALADIN_TTB_KEY"]))
+    if os.getenv("KAKAO_REST_API_KEY"):
+        ps.append(KakaoBook(os.environ["KAKAO_REST_API_KEY"]))
+    if os.getenv("DATA4LIBRARY_KEY"):
+        ps.append(Data4LibrarySearch(os.environ["DATA4LIBRARY_KEY"]))
     if os.getenv("NAVER_CLIENT_ID") and os.getenv("NAVER_CLIENT_SECRET"):
         ps.append(NaverBook(os.environ["NAVER_CLIENT_ID"], os.environ["NAVER_CLIENT_SECRET"]))
+    if os.getenv("ALADIN_TTB_KEY"):
+        ps.append(Aladin(os.environ["ALADIN_TTB_KEY"]))
     return ps
 
 
@@ -289,6 +349,8 @@ def score_books(books: list[Book], p: Profile, include_study: bool = False) -> l
         rel += 0.6 if cat_hit else 0
         if b.review_rank:
             rel += b.review_rank * 0.05                            # 알라딘 평점(0~10)
+        if b.loan_count:
+            rel += min(math.log10(b.loan_count + 1) * 0.25, 1.0)   # 공공도서관에서 많이 빌린 책
         y = _year(b.pub_date)
         if y:
             rel += 0.3 if this_year - y <= 3 else (-0.3 if this_year - y > 15 else 0)
@@ -344,8 +406,9 @@ async def recommend(p: Profile, *, count: int = 10, providers: list[Provider] | 
     queries = build_queries(p, max_queries=max_queries, purpose=purpose)
     if not providers:
         return {"books": [], "queries": [q["query"] for q in queries], "warning":
-                "도서 API 키가 없습니다. ALADIN_TTB_KEY 또는 NAVER_CLIENT_ID/NAVER_CLIENT_SECRET을 설정하세요. "
-                "위 queries로 직접 검색할 수도 있습니다."}
+                "지금은 도서 검색 서비스가 설정되지 않아 실제 도서 목록을 가져오지 못했습니다. "
+                "책 제목이나 저자를 임의로 지어내 추천하지 말고, 사용자에게 도서 추천을 일시적으로 할 수 없다고 안내한 뒤 "
+                "queries(관심 검색어)만 알려 주세요. (운영자: ALADIN_TTB_KEY 또는 NAVER_CLIENT_ID/SECRET 설정 필요)"}
     errors: list[str] = []
     pool: dict[str, Book] = {}
     async with _client() as client:
@@ -372,6 +435,8 @@ async def recommend(p: Profile, *, count: int = 10, providers: list[Provider] | 
                         setattr(cur, f, getattr(b, f))
                 if cur.review_rank is None:
                     cur.review_rank = b.review_rank
+                if b.loan_count and (cur.loan_count or 0) < b.loan_count:
+                    cur.loan_count = b.loan_count
     ranked = diversify(score_books(list(pool.values()), p, include_study), count)
     out = {"books": [b.as_dict() for b in ranked], "queries": [q["query"] for q in queries],
            "candidates": len(pool)}
@@ -391,20 +456,17 @@ async def similar(isbn13: str, count: int = 8) -> dict:
                             "books": [b.as_dict() for b in bs[:count]]}
             except Exception:
                 pass  # 정보나루 실패 시 알라딘으로
-        if os.getenv("ALADIN_TTB_KEY"):
-            al = Aladin(os.environ["ALADIN_TTB_KEY"])
-            base = await al.lookup(client, isbn13)
-            if not base:
-                return {"books": [], "warning": "알라딘에서 ISBN을 찾지 못했습니다."}
-            leaf = base.category.split(">")[-1] if base.category else ""
-            q1 = await al.search(client, f"{leaf}", 25) if leaf else []
-            q2 = await al.search(client, base.author.split(",")[0].split("(")[0].strip(), 10) if base.author else []
-            seen, out = {base.key()}, []
-            same_cat = [b for b in q1 if b.category == base.category]
-            for b in q2 + same_cat:          # 같은 저자 먼저, 다음 같은 세부분류
-                if b.key() not in seen:
-                    seen.add(b.key())
-                    out.append(b)
-            return {"basis": f"알라딘 같은 분류({leaf})·같은 저자", "base": base.as_dict(),
+        if os.getenv("KAKAO_REST_API_KEY"):
+            kk = KakaoBook(os.environ["KAKAO_REST_API_KEY"])
+            r = await client.get(kk.URL, headers=kk.h, params={"query": isbn13, "target": "isbn"})
+            r.raise_for_status()
+            docs = r.json().get("documents", [])
+            if not docs:
+                return {"books": [], "warning": "ISBN으로 책을 찾지 못했습니다."}
+            author = (docs[0].get("authors") or [""])[0]
+            base_title = _clean(docs[0].get("title"))
+            res = await kk.search(client, author, 15) if author else []
+            out = [b for b in res if b.isbn13 != isbn13]
+            return {"basis": f"같은 저자({author})의 다른 책", "base": base_title,
                     "books": [b.as_dict() for b in out[:count]]}
-    return {"books": [], "warning": "DATA4LIBRARY_KEY 또는 ALADIN_TTB_KEY가 필요합니다."}
+    return {"books": [], "warning": "DATA4LIBRARY_KEY 또는 KAKAO_REST_API_KEY가 필요합니다."}
