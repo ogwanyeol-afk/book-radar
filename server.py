@@ -30,6 +30,7 @@ mcp = MCPServer(
         "관심 주제를 뽑고 국내 도서를 추천합니다. 기록이 없으면 history_export_guide로 내보내는 방법을 안내하고, "
         "사용자가 관심사를 말로만 알려주면 keywords로 recommend_books를 호출하세요. "
         "추천 결과의 buy_links로 서점별 구매 페이지를 안내하세요(주문·결제는 사용자가 서점에서 직접). "
+        "도구가 돌려준 책만 추천하고, 결과에 없는 책 제목·저자를 지어내지 마세요. "
         "기록 원문은 저장하지 않으며, 답변에서 사용자의 개별 검색어를 그대로 나열하지 마세요."
     ),
 )
@@ -88,7 +89,6 @@ def history_export_guide(source: Literal["youtube", "google", "naver", "all"] = 
     return GUIDE if source == "all" else {source: GUIDE[source]}
 
 
-@mcp.tool(annotations=RO)
 def analyze_interests(
     history_text: str | None = None,
     source: Source = "auto",
@@ -108,7 +108,6 @@ def analyze_interests(
     return p.as_dict(25)
 
 
-@mcp.tool(annotations=RO)
 async def recommend_books(
     history_text: str | None = None,
     keywords: list[str] | None = None,
@@ -144,6 +143,38 @@ async def recommend_books(
     res["interest_summary"] = [{"topic": t, "keywords": ks} for t, _, ks in p.topics[:5]]
     res["stats"] = p.stats
     return res
+
+
+if LOCAL_FILES:   # 로컬 실행: 테이크아웃 파일 경로(file_paths)까지 받는 버전
+    mcp.tool(annotations=RO)(analyze_interests)
+    mcp.tool(annotations=RO)(recommend_books)
+else:             # 공개 서버(PlayMCP): file_paths 없는 버전만 노출
+    @mcp.tool(name="analyze_interests", annotations=RO)
+    def analyze_interests_remote(history_text: str, source: Source = "auto", days: int | None = None,
+                                 exclude_keywords: list[str] | None = None) -> dict:
+        """시청·검색 기록에서 관심 키워드와 관심 주제를 뽑아 보여줍니다(추천 전 확인용).
+
+        history_text: 붙여넣은 기록(네이버 최근 검색어, 유튜브 시청기록, 구글 테이크아웃 JSON/HTML 내용)
+        source: 기록 출처(네이버 붙여넣기면 'naver')
+        days: 최근 N일만 분석
+        exclude_keywords: 분석에서 뺄 단어(예: 업무용 검색어)
+        """
+        return analyze_interests(history_text, source, days, exclude_keywords)
+
+    @mcp.tool(name="recommend_books", annotations=RO)
+    async def recommend_books_remote(history_text: str | None = None, keywords: list[str] | None = None,
+                                     source: Source = "auto", count: int = 10, purpose: str | None = None,
+                                     exclude_titles: list[str] | None = None, include_study: bool = False,
+                                     days: int | None = None, exclude_keywords: list[str] | None = None) -> dict:
+        """시청·검색 기록 또는 관심 키워드로 도서를 추천합니다. 각 책에 추천 이유와 서점별 구매 링크(buy_links)가 붙습니다.
+
+        history_text 또는 keywords 중 하나는 필요합니다. keywords는 중요한 것부터 순서대로.
+        purpose: '입문', '실전', '에세이'처럼 원하는 책 성격
+        exclude_titles: 이미 읽은 책 제목(일부만 써도 됨)
+        include_study: 수험서·참고서도 포함할지
+        """
+        return await recommend_books(history_text, keywords, source, count, purpose, exclude_titles,
+                                     include_study, days, exclude_keywords)
 
 
 @mcp.tool(annotations=RO)
