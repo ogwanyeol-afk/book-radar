@@ -326,6 +326,9 @@ def build_queries(p: Profile, max_queries: int = 10, purpose: str | None = None)
 
 # ---------------------------------------------------------------- 점수화
 
+_AI_AUTHOR = re.compile(r"\b(gemini|gpt|chatgpt|claude|llama|copilot|grok)\b", re.I)
+
+
 def _year(pd: str) -> int | None:
     m = re.match(r"(\d{4})", pd or "")
     return int(m.group(1)) if m else None
@@ -339,6 +342,8 @@ def score_books(books: list[Book], p: Profile, include_study: bool = False) -> l
     for b in books:
         if not include_study and any(x in b.category for x in EXCLUDED_CATEGORIES):
             continue
+        if _AI_AUTHOR.search(b.author or ""):
+            continue  # AI 모델명을 저자로 단 자동생성 출판물
         text = f"{b.title} {b.description} {b.category}".lower()
         title = b.title.lower()
         matched = [(k, s) for k, s in top if k in text]
@@ -354,6 +359,10 @@ def score_books(books: list[Book], p: Profile, include_study: bool = False) -> l
         y = _year(b.pub_date)
         if y:
             rel += 0.3 if this_year - y <= 3 else (-0.3 if this_year - y > 15 else 0)
+        if b.price and b.price < 10000 and not b.loan_count:
+            rel -= 0.8                                             # 소책자·저가 자가출판물 감점
+        if y and this_year - y == 0 and not b.loan_count and "data4library" not in b.sources:
+            rel -= 0.2                                             # 검증 안 된 올해 신간 소폭 감점
         best_rank = min(q.get("rank", 20) for q in b.queries)
         rel += max(0, (10 - best_rank)) * 0.04                     # 검색 정확도 순위
         b.score = rel
@@ -367,7 +376,7 @@ def score_books(books: list[Book], p: Profile, include_study: bool = False) -> l
 def diversify(books: list[Book], count: int) -> list[Book]:
     """한 주제가 결과를 독식하지 않게 주제별 상한을 둔다."""
     topics = {(b.queries[0].get("topic") or "기타") for b in books}
-    cap = max(2, math.ceil(count / max(len(topics), 1)) + 1)
+    cap = max(1, math.ceil(count / max(len(topics), 1)))
     picked, per = [], {}
     for b in books:
         t = b.queries[0].get("topic") or "기타"
