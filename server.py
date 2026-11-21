@@ -17,6 +17,7 @@ from mcp.types import ToolAnnotations
 
 from bookrec.books import buy_links, recommend, similar
 from bookrec.history import build_profile, parse_history, profile_from_keywords
+from bookrec.youtube import TokenStore, fetch_liked, liked_to_entries
 
 LOCAL_FILES = os.getenv("BOOKREC_LOCAL_FILES") == "1"
 MAX_TEXT = 3_000_000  # 붙여넣기 기록 최대 3MB
@@ -193,6 +194,52 @@ def book_purchase_links(isbn13: str | None = None, title: str | None = None) -> 
             "note": "ISBN으로 검색되어 해당 책 상품 페이지로 바로 연결됩니다. 결제는 각 서점에서 진행하세요."}
 
 
+# ---------------------------------------------------------------- 대표님 전용: 내 유튜브 좋아요
+OWNER = TokenStore.from_env()          # GOOGLE_CLIENT_ID/SECRET + OWNER_YOUTUBE_REFRESH_TOKEN 이 있을 때만
+OWNER_ACCESS_KEY = os.getenv("OWNER_ACCESS_KEY", "")
+
+if OWNER:
+    @mcp.tool(annotations=RO)
+    async def my_youtube_likes(limit: int = 200) -> dict:
+        """내 유튜브 '좋아요 표시한 동영상'에서 관심 키워드·주제를 뽑아 보여줍니다(대표님 계정 전용)."""
+        vids = await fetch_liked(OWNER, max(10, min(limit, 500)))
+        p = build_profile(liked_to_entries(vids))
+        return {"liked_videos": len(vids), "recent_titles": [v["title"] for v in vids[:10]], **p.as_dict(20)}
+
+    @mcp.tool(annotations=RO)
+    async def recommend_from_my_youtube_likes(count: int = 10, purpose: str | None = None,
+                                             limit: int = 200, exclude_titles: list[str] | None = None,
+                                             exclude_keywords: list[str] | None = None) -> dict:
+        """내 유튜브 좋아요 기록으로 책을 추천합니다(대표님 계정 전용). 추천 이유·서점 구매 링크 포함.
+
+        purpose: '입문', '실전' 등 원하는 책 성격 / limit: 분석할 최근 좋아요 영상 수
+        """
+        vids = await fetch_liked(OWNER, max(10, min(limit, 500)))
+        p = build_profile(liked_to_entries(vids), exclude=exclude_keywords)
+        res = await recommend(p, count=max(1, min(count, 30)), exclude_titles=exclude_titles, purpose=purpose)
+        res["interest_summary"] = [{"topic": t, "keywords": ks} for t, _, ks in p.topics[:5]]
+        res["liked_videos_used"] = len(vids)
+        return res
+
+
+class AccessKeyGuard:
+    """OWNER_ACCESS_KEY가 설정된 서버는 /mcp 요청에 ?key= 또는 X-Access-Key 헤더가 맞아야 통과."""
+
+    def __init__(self, app, key: str):
+        self.app, self.key = app, key
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"].startswith("/mcp"):
+            from urllib.parse import parse_qs
+            qs = parse_qs(scope.get("query_string", b"").decode())
+            hdr = dict(scope.get("headers") or []).get(b"x-access-key", b"").decode()
+            if self.key not in (qs.get("key", [""])[0], hdr):
+                from starlette.responses import JSONResponse
+                await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
 @mcp.custom_route("/health", methods=["GET"])
 async def health(_request):
     from starlette.responses import JSONResponse
@@ -204,5 +251,10 @@ if __name__ == "__main__":
     if transport == "stdio":
         mcp.run("stdio")
     else:
-        mcp.run("streamable-http", host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8000")),
-                stateless_http=True, json_response=True)
+        import uvicorn
+        app = mcp.streamable_http_app(stateless_http=True, json_response=True, host="0.0.0.0")
+        if OWNER_ACCESS_KEY:
+            app = AccessKeyGuard(app, OWNER_ACCESS_KEY)
+        elif OWNER:
+            raise SystemExit("개인 유튜브 토큰이 있는 서버는 OWNER_ACCESS_KEY도 설정해야 합니다(외부 노출 방지).")
+        uvicorn.run(app, host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8000")))
