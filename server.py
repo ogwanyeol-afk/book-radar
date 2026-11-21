@@ -223,21 +223,35 @@ if OWNER:
 
 
 class AccessKeyGuard:
-    """OWNER_ACCESS_KEY가 설정된 서버는 /mcp 요청에 ?key= 또는 X-Access-Key 헤더가 맞아야 통과."""
+    """OWNER_ACCESS_KEY가 설정된 서버 보호.
+    - 권장 주소: /k/<키>/mcp  (키가 경로에 있어 클라이언트가 쿼리를 떼어도 안전)
+    - 호환: /mcp?key=<키> 또는 X-Access-Key 헤더
+    - 키가 틀리면 401이 아니라 404 — 401을 주면 Claude 등이 OAuth 로그인 서버로 오인한다.
+    """
 
     def __init__(self, app, key: str):
         self.app, self.key = app, key
+        self.prefix = f"/k/{key}"
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["path"].startswith("/mcp"):
-            from urllib.parse import parse_qs
-            qs = parse_qs(scope.get("query_string", b"").decode())
-            hdr = dict(scope.get("headers") or []).get(b"x-access-key", b"").decode()
-            if self.key not in (qs.get("key", [""])[0], hdr):
-                from starlette.responses import JSONResponse
-                await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
-                return
+        if scope["type"] == "http":
+            path = scope["path"]
+            if path.startswith(self.prefix + "/"):
+                scope = dict(scope, path=path[len(self.prefix):], raw_path=path[len(self.prefix):].encode())
+            elif path.startswith("/mcp"):
+                from urllib.parse import parse_qs
+                qs = parse_qs(scope.get("query_string", b"").decode())
+                hdr = dict(scope.get("headers") or []).get(b"x-access-key", b"").decode()
+                if self.key not in (qs.get("key", [""])[0], hdr):
+                    return await self._404(scope, receive, send)
+            elif path != "/health":
+                return await self._404(scope, receive, send)
         await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _404(scope, receive, send):
+        from starlette.responses import PlainTextResponse
+        await PlainTextResponse("Not Found", status_code=404)(scope, receive, send)
 
 
 @mcp.custom_route("/health", methods=["GET"])
