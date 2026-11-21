@@ -195,7 +195,7 @@ def _tokens(text: str) -> list[str]:
     return out
 
 
-KIND_WEIGHT = {"search": 1.5, "watch": 1.0, "text": 1.0, "visit": 0.4}
+KIND_WEIGHT = {"like": 2.0, "search": 1.5, "watch": 1.0, "text": 1.0, "visit": 0.4}
 
 
 @dataclass
